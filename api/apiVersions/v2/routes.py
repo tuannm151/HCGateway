@@ -1,21 +1,23 @@
+import influxdb_client, os, json, time
 from flask import Blueprint, request, jsonify, g
-import os, json
 from dotenv import load_dotenv
+from utils.metrics_transformer import transform_batch_metrics
 load_dotenv()
-from pyfcm import FCMNotification
 
-import pymongo
-from bson.objectid import ObjectId
-from bson.errors import *
-mongo = pymongo.MongoClient(os.environ['MONGO_URI'])
+from config.database import find_user_by_token, find_user_by_username, find_user_by_refresh, find_user_by_id, create_user, update_user_tokens
 
 from argon2 import PasswordHasher
-ph = PasswordHasher()
 
-from cryptography.fernet import Fernet
-import base64, secrets, datetime
+import datetime
+
+from config.influxdb import get_influxdb_config
+from influxdb_client import InfluxDBClient, Point, WritePrecision
+from influxdb_client.client.write_api import SYNCHRONOUS
+from utils.metrics_transformer import transform_health_metrics
 
 v2 = Blueprint('v2', __name__, url_prefix='/api/v2/')
+
+ph = PasswordHasher()
 
 @v2.before_request
 def before_request():
@@ -26,18 +28,18 @@ def before_request():
         return jsonify({'error': 'no token provided'}), 400
 
     token = request.headers.get('Authorization').split(' ')[1]
-    db = mongo['hcgateway']
-    usrStore = db['users']
-
-    user = usrStore.find_one({'token': token})
+    
+    user = find_user_by_token(token)
 
     if not user:
         return jsonify({'error': 'invalid token'}), 403
     
-    if datetime.datetime.now() > user['expiry']:
+    expiry = datetime.datetime.fromisoformat(user['expiry'])
+    if datetime.datetime.now() > expiry:
         return jsonify({'error': 'token expired. Use /api/v2/login to reauthenticate.'}), 403
     
-    g.user = user['_id']
+    g.user_id = user['id']
+    g.user_name = user['username']
 
     return
 
@@ -47,27 +49,17 @@ def login():
         return jsonify({'error': 'invalid request'}), 400
     username = request.json['username']
     password = request.json['password']
-    fcmToken = request.json['fcmToken'] if 'fcmToken' in request.json else None
 
-    db = mongo['hcgateway']
-    usrStore = db['users']
-
-    user = usrStore.find_one({'username': username})
+    user = find_user_by_username(username)
 
     if not user:
-        user = usrStore.insert_one({'username': username, 'password': ph.hash(password)}).inserted_id
-        usrStore.insert_one({'_id': str(user), 'username': username, 'password': ph.hash(password)})
-        usrStore.delete_one({'_id': ObjectId(user)})
-
-        token = secrets.token_urlsafe(32)
-        refresh = secrets.token_urlsafe(32)
-        expiryDate = datetime.datetime.now() + datetime.timedelta(hours=12)
-        usrStore.update_one({'_id': str(user)}, {"$set": {'token': token, 'refresh': refresh, 'expiry': expiryDate}})
-
+        # Create new user with SQLite
+        new_user = create_user(username, password)
+        
         return jsonify({
-            "token": token,
-            "refresh": refresh,
-            "expiry": expiryDate.isoformat()
+            "token": new_user['token'],
+            "refresh": new_user['refresh'],
+            "expiry": new_user['expiry']
         }), 201
     
     try:
@@ -75,91 +67,82 @@ def login():
     except: 
         return jsonify({'error': 'invalid password'}), 403
    
-    if fcmToken:
-        try:
-            usrStore.update_one({'username': username}, {"$set": {'fcmToken': fcmToken}})
-        except:
-            return jsonify({'error': 'failed to update fcm token'}), 500
-        
-    sessid = user['_id']
+    user_id = user['id']
 
-    if not "expiry" in user or datetime.datetime.now() > user['expiry']:
-        token = secrets.token_urlsafe(32)
-        refresh = secrets.token_urlsafe(32)
-        expiryDate = datetime.datetime.now() + datetime.timedelta(hours=12)
-        usrStore.update_one({'_id': sessid}, {"$set": {'token': token, 'refresh': refresh, 'expiry': expiryDate}})
-
+    expiry = datetime.datetime.fromisoformat(user['expiry']) if 'expiry' in user else None
+    if not expiry or datetime.datetime.now() > expiry:
+        # Update tokens
+        token_data = update_user_tokens(user_id)
+        token = token_data['token']
+        refresh = token_data['refresh']
+        expiry_str = token_data['expiry']
     else:
         token = user['token']
         refresh = user['refresh']
-        expiryDate = user['expiry']
+        expiry_str = user['expiry']
 
     return jsonify({
             "token": token,
             "refresh": refresh,
-            "expiry": expiryDate.isoformat()
+            "expiry": expiry_str
     }), 201
-
 
 @v2.route("/refresh", methods=['POST'])
 def refresh():
     if not request.json or not 'refresh' in request.json:
         return jsonify({'error': 'invalid request'}), 400
 
-    refresh = request.json['refresh']
+    refresh_token = request.json['refresh']
 
-    db = mongo['hcgateway']
-    usrStore = db['users']
-
-    user = usrStore.find_one({'refresh': refresh})
+    user = find_user_by_refresh(refresh_token)
 
     if not user:
         return jsonify({'error': 'invalid refresh token'}), 403
     
-    token = secrets.token_urlsafe(32)
-    refresh = secrets.token_urlsafe(32)
-    expiryDate = datetime.datetime.now() + datetime.timedelta(hours=12)
-    usrStore.update_one({'_id': user['_id']}, {"$set": {'token': token, 'refresh': refresh, 'expiry': expiryDate}})
+    # Update tokens
+    token_data = update_user_tokens(user['id'])
 
     return jsonify({
-            "token": token,
-            "refresh": refresh,
-            "expiry": expiryDate.isoformat()
+            "token": token_data['token'],
+            "refresh": token_data['refresh'],
+            "expiry": token_data['expiry']
     }), 200
 
 @v2.post("/sync/<method>")
 def sync(method):
-    print(request.json)
     method = method[0].lower() + method[1:]
     if not method:
         return jsonify({'error': 'no method provided'}), 400
     if not "data" in request.json:
         return jsonify({'error': 'no data provided'}), 400
     
-    userid = g.user
-    print(userid)
-
-    db = mongo['hcgateway']
-    usrStore = db['users']
-
-    try: user = usrStore.find_one({'_id': userid})
-    except InvalidId: return jsonify({'error': 'invalid user id'}), 400
-
-    print(user)
-    hashed_password = user['password']
-    key = base64.urlsafe_b64encode(hashed_password.encode("utf-8").ljust(32)[:32])
-    fernet = Fernet(key)
+    userid = g.user_id
 
     data = request.json['data']
     if type(data) != list:
         data = [data]
-    print(method, len(data))
-
-    db = mongo['hcgateway_'+userid]
-    collection = db[method]
     
+    # InfluxDB sync - using only InfluxDB for data storage
+    influx_config = get_influxdb_config()
+
+    client = influxdb_client.InfluxDBClient(
+        url=influx_config['host'],
+        token=influx_config['token'],
+        org=influx_config['org']
+    )
+
+    write_api = client.write_api(write_options=SYNCHRONOUS)
+    bucket_api = client.buckets_api()
+
+    userBucket = f"{influx_config['bucket_prefix']}_{userid}_{g.user_name}"
+    try:
+        bucket = bucket_api.find_bucket_by_name(userBucket)
+        if not bucket:
+            raise Exception("Bucket not found")
+    except:
+        bucket_api.create_bucket(bucket_name=userBucket, org=influx_config['org'])
+        
     for item in data:
-        # print(item)
         itemid = item['metadata']['id']
         dataObj = {}
         for k, v in item.items():
@@ -172,21 +155,21 @@ def sync(method):
         else:
             starttime = item['startTime']
             endtime = item['endTime']
-
-        toencrypt = json.dumps(dataObj).encode()
-        encrypted = fernet.encrypt(toencrypt).decode()
-
-        # fernet.decrypt(encrypted.encode()).decode()
-
-        # print(starttime, endtime)
-        try:
-            print("creating")
-            collection.insert_one({"_id": itemid, "id": itemid, 'data': encrypted, "app": item['metadata']['dataOrigin'], "start": starttime, "end": endtime})
-        except:
-            print("updating")
-            collection.update_one({"_id": itemid}, {"$set": 
-                                                 {'data': encrypted, "app": item['metadata']['dataOrigin'], "start": starttime, "end": endtime}
-                                                })
+        
+        # Store all fields directly for querying
+        # Transform numeric fields into metrics
+        transformed_data = transform_health_metrics(dataObj)
+        points = []
+        for k, v in transformed_data.items():
+            point = Point(method)
+            point.time(endtime if endtime else starttime if starttime else datetime.datetime.now())
+            point.tag("user_id", userid)
+            point.tag("user_name", g.user_name)
+            point.tag("app", item['metadata']['dataOrigin'])
+            point.tag("item_id", itemid)
+            point.field(k, float(v))
+            points.append(point)
+        write_api.write(bucket=userBucket, org=influx_config['org'], record=points)
 
     return jsonify({'success': True}), 200
 
@@ -195,40 +178,73 @@ def fetch(method):
     if not method:
         return jsonify({'error': 'no method provided'}), 400
 
-    userid = g.user
-    db = mongo['hcgateway']
-    usrStore = db['users']
-
-    try: user = usrStore.find_one({'_id': userid})
-    except InvalidId: return jsonify({'error': 'invalid user id'}), 400
-
-    hashed_password = user['password']
-    key = base64.urlsafe_b64encode(hashed_password.encode("utf-8").ljust(32)[:32])
-    fernet = Fernet(key)
-
+    userid = g.user_id
+    
+    # Get query parameters
     if not "queries" in request.json:
-        queries = []
+        queries = {}
     else:
         queries = request.json['queries']
     
-    db = mongo['hcgateway_'+userid]
-    collection = db[method]
+    # Get InfluxDB configuration
+    influx_config = get_influxdb_config(userid)
     
+    # Connect to InfluxDB
+    client = InfluxDBClient3(
+        host=influx_config['host'],
+        token=influx_config['token'],
+        org=influx_config['org']
+    )
+    
+    # Build query parameters
+    query_params = [f"_measurement = '{method}'"]
+    query_params.append(f"user_id = '{userid}'")
+    
+    # Add additional query parameters if provided
+    for key, value in queries.items():
+        if key == 'app' and value:
+            query_params.append(f"app = '{value}'")
+        if key == 'item_id' and value:
+            query_params.append(f"item_id = '{value}'")
+        if key == 'start_time' and value:
+            query_params.append(f"_time >= '{value}'")
+        if key == 'end_time' and value:
+            query_params.append(f"_time <= '{value}'")
+    
+    # Build and execute query
+    query = f"SELECT * FROM {influx_config['bucket']} WHERE {' AND '.join(query_params)}"
+    tables = client.query(query=query)
+    
+    # Process results
     docs = []
-    for doc in collection.find(queries):
-        doc['data'] = json.loads(fernet.decrypt(doc['data'].encode()).decode())
-        docs.append(doc)
+    for table in tables:
+        for record in table.records:
+            # Extract data
+            item = {
+                'id': record.values.get('item_id'),
+                'app': record.values.get('app'),
+                'time': record.values.get('_time').isoformat()
+            }
+            
+            # Add all fields to data
+            item['data'] = {}
+            for key, value in record.values.items():
+                if key not in ['_measurement', '_time', 'user_id', 'app', 'item_id']:
+                    item['data'][key] = value
+            
+            docs.append(item)
 
     return jsonify(docs), 200
 
-@v2.route("/push/<method>", methods=['PUT'])
-def pushData(method):
+
+@v2.route("/push/<method>", methods=['POST'])
+def push_data(method):
     if not method:
         return jsonify({'error': 'no method provided'}), 400
     if not "data" in request.json:
         return jsonify({'error': 'no data provided'}), 400
 
-    userid = g.user
+    userid = g.user_id
     data = request.json['data']
     if type(data) != list:
         data = [data]
@@ -241,89 +257,9 @@ def pushData(method):
         if ("startTime" in r and "endTime" not in r) or ("startTime" not in r and "endTime" in r):
             return jsonify({'error': 'start time and end time must be provided together.'}), 400
 
-    db = mongo['hcgateway']
-    usrStore = db['users']
-
-    try: user = usrStore.find_one({'_id': userid})
-    except InvalidId: return jsonify({'error': 'invalid user id'}), 400
-
-    fcmToken = user['fcmToken'] if 'fcmToken' in user else None
-    if not fcmToken:
-        return jsonify({'error': 'no fcm token found'}), 404
-
-    fcm = FCMNotification(service_account_file='service-account.json', project_id=os.environ['FCM_PROJECT_ID'])
-
-    try:
-        fcm.notify(fcm_token=fcmToken, data_payload={
-            "op": "PUSH",
-            "data": json.dumps(data),
-        })
-    except Exception as e:
-        return jsonify({'error': 'Message delivery failed'}), 500
+    # Get user from SQLite
+    user = find_user_by_id(userid)
+    if not user:
+        return jsonify({'error': 'invalid user id'}), 400
 
     return jsonify({'success': True, "message": "request has been sent to device."}), 200
-
-@v2.route("/delete/<method>", methods=['DELETE'])
-def delData(method):
-    if not method:
-        return jsonify({'error': 'no method provided'}), 400
-    if not "uuid" in request.json:
-        return jsonify({'error': 'no uuid provided'}), 400
-
-    userid = g.user
-    uuids = request.json['uuid']
-    if type(uuids) != list:
-        uuids = [uuids]
-
-    fixedMethodName = method[0].upper() + method[1:]
-
-    db = mongo['hcgateway']
-    usrStore = db['users']
-
-    try: user = usrStore.find_one({'_id': userid})
-    except InvalidId: return jsonify({'error': 'invalid user id'}), 400
-
-    fcmToken = user['fcmToken'] if 'fcmToken' in user else None
-    if not fcmToken:
-        return jsonify({'error': 'no fcm token found'}), 404
-
-    fcm = FCMNotification(service_account_file='service-account.json', project_id=os.environ['FCM_PROJECT_ID'])
-
-    try:
-        fcm.notify(fcm_token=fcmToken, data_payload={
-            "op": "DEL",
-            "data": json.dumps({
-                "uuids": uuids,
-                "recordType": fixedMethodName
-            }),
-        })
-    except Exception as e:
-        return jsonify({'error': 'Message delivery failed'}), 500
-
-
-    return jsonify({'success': True, "message": "request has been sent to device."}), 200
-
-
-@v2.delete("/sync/<method>")
-def delFromDb(method):
-    method = method[0].lower() + method[1:]
-    if not method:
-        return jsonify({'error': 'no method provided'}), 400
-    if not "uuid" in request.json:
-        return jsonify({'error': 'no uuid provided'}), 400
-
-    userid = g.user
-    uuids = request.json['uuid']
-
-    if type(uuids) != list:
-        uuids = [uuids]
-
-    db = mongo['hcgateway_'+userid]
-    collection = db[method]
-    print(collection)
-    for uuid in uuids:
-        print(uuid)
-        try: collection.delete_one({"_id": uuid})
-        except Exception as e: print(e)
-
-    return jsonify({'success': True}), 200

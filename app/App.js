@@ -5,17 +5,13 @@ import {
   initialize,
   requestPermission,
   readRecords,
-  readRecord,
-  insertRecords,
-  deleteRecordsByUuids
+  readRecord
 } from 'react-native-health-connect';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Toast from 'react-native-toast-message';
 import axios from 'axios';
 import ReactNativeForegroundService from '@supersami/rn-foreground-service';
 import {requestNotifications} from 'react-native-permissions';
-import * as Sentry from '@sentry/react-native';
-import messaging from '@react-native-firebase/messaging';
 import {Notifications} from 'react-native-notifications';
 
 const setObj = async (key, value) => { try { const jsonValue = JSON.stringify(value); await AsyncStorage.setItem(key, jsonValue) } catch (e) { console.log(e) } }
@@ -37,55 +33,7 @@ Notifications.setNotificationChannel({
   vibrationPattern: [200, 1000, 500, 1000, 500],
 })
 
-let isSentryEnabled = true;
-get('sentryEnabled')
-  .then(res => {
-    if (res != "false") {
-      Sentry.init({
-        dsn: 'https://e4a201b96ea602d28e90b5e4bbe67aa6@sentry.shuchir.dev/6',
-        // enableSpotlight: __DEV__,
-      });
-      Toast.show({
-        type: 'success',
-        text1: "Sentry enabled from settings",
-      });
-    } else {
-      isSentryEnabled = false;
-      Toast.show({
-        type: 'info',
-        text1: "Sentry is disabled",
-      });
-    }
-  })
-  .catch(err => {
-    console.log(err);
-    Toast.show({
-      type: 'error',
-      text1: "Failed to check Sentry settings",
-    });
-  });
 ReactNativeForegroundService.register();
-
-const requestUserPermission = async () => {
-  try {
-    await messaging().requestPermission();
-    const token = await messaging().getToken();
-    console.log('Device Token:', token);
-    return token;
-  } catch (error) {
-    console.log('Permission or Token retrieval error:', error);
-  }
-};
-
-messaging().setBackgroundMessageHandler(async remoteMessage => {
-  if (remoteMessage.data.op == "PUSH") handlePush(remoteMessage.data);
-  if (remoteMessage.data.op == "DEL") handleDel(remoteMessage.data);
-});
-
-messaging().onMessage(remoteMessage => {
-  if (remoteMessage.data.op == "PUSH") handlePush(remoteMessage.data);
-  if (remoteMessage.data.op == "DEL") handleDel(remoteMessage.data);
-});
 
 let login;
 let apiBase = 'https://api.hcgateway.shuchir.dev';
@@ -132,7 +80,7 @@ get('lastSync')
 
 
 const askForPermissions = async () => {
-  const isInitialized = await initialize();
+  await initialize();
 
   const grantedPermissions = await requestPermission([
     { accessType: 'read', recordType: 'ActiveCaloriesBurned' },
@@ -205,8 +153,6 @@ const askForPermissions = async () => {
     { accessType: 'write', recordType: 'WheelchairPushes' },
   ]);
 
-  console.log(grantedPermissions);
-
   if (grantedPermissions.length < 68) {
     Toast.show({
       type: 'error',
@@ -216,209 +162,136 @@ const askForPermissions = async () => {
   }
 };
 
-const refreshTokenFunc = async () => {
-  let refreshToken = await get('refreshToken');
-  if (!refreshToken) return;
-  try {
-    let response = await axios.post(`${apiBase}/api/v2/refresh`, {
-      refresh: refreshToken
-    });
-    if ('token' in response.data) {
-      console.log(response.data);
-      await setPlain('login', response.data.token)
-      login = response.data.token;
-      await setPlain('refreshToken', response.data.refresh);
-      Toast.show({
-        type: 'success',
-        text1: "Token refreshed successfully",
-      })
-    }
-    else {
-      Toast.show({
-        type: 'error',
-        text1: "Token refresh failed",
-        text2: response.data.error
-      })
-      login = null;
-      delkey('login');
-    }
-  }
-
-  catch (err) {
-    Toast.show({
-      type: 'error',
-      text1: "Token refresh failed",
-      text2: err.message
-    })
-    login = null;
-    delkey('login');
-  }
-}
-
 const sync = async () => {
-  const isInitialized = await initialize();
+  await initialize();
   console.log("Syncing data...");
   let numRecords = 0;
   let numRecordsSynced = 0;
+  let failedRecords = [];
+
   Toast.show({
     type: 'info',
     text1: "Syncing data...",
-  })
+  });
+
   await setPlain('lastSync', new Date().toISOString());
   lastSync = new Date().toISOString();
 
-  let recordTypes = ["ActiveCaloriesBurned", "BasalBodyTemperature", "BloodGlucose", "BloodPressure", "BasalMetabolicRate", "BodyFat", "BodyTemperature", "BoneMass", "CyclingPedalingCadence", "CervicalMucus", "ExerciseSession", "Distance", "ElevationGained", "FloorsClimbed", "HeartRate", "Height", "Hydration", "LeanBodyMass", "MenstruationFlow", "MenstruationPeriod", "Nutrition", "OvulationTest", "OxygenSaturation", "Power", "RespiratoryRate", "RestingHeartRate", "SleepSession", "Speed", "Steps", "StepsCadence", "TotalCaloriesBurned", "Vo2Max", "Weight", "WheelchairPushes"]; 
-  
-  for (let i = 0; i < recordTypes.length; i++) {
-      let records;
-      try {
-      records = await readRecords(recordTypes[i],
-        {
-          timeRangeFilter: {
-            operator: "between",
-            startTime: String(new Date(new Date().setDate(new Date().getDate() - 29)).toISOString()),
-            endTime: String(new Date().toISOString())
-          }
+  const recordTypes = ["ActiveCaloriesBurned", "BasalBodyTemperature", "BloodGlucose", "BloodPressure", "BasalMetabolicRate", "BodyFat", "BodyTemperature", "BoneMass", "CyclingPedalingCadence", "CervicalMucus", "ExerciseSession", "Distance", "ElevationGained", "FloorsClimbed", "HeartRate", "Height", "Hydration", "LeanBodyMass", "MenstruationFlow", "MenstruationPeriod", "Nutrition", "OvulationTest", "OxygenSaturation", "Power", "RespiratoryRate", "RestingHeartRate", "SleepSession", "Speed", "Steps", "StepsCadence", "TotalCaloriesBurned", "Vo2Max", "Weight", "WheelchairPushes"];
+
+  const updateProgress = () => {
+    try {
+      ReactNativeForegroundService.update({
+        id: 1244,
+        title: 'HCGateway Sync Progress',
+        message: `HCGateway is currently syncing... [${numRecordsSynced}/${numRecords}]`,
+        icon: 'ic_launcher',
+        setOnlyAlertOnce: true,
+        color: '#000000',
+        progress: {
+          max: numRecords,
+          curr: numRecordsSynced,
         }
-      );
+      });
+    } catch (err) {
+      console.error('Error updating progress:', err);
+    }
+  };
 
-      records = records.records;
-      }
-      catch (err) {
-        console.log(err)
-        continue;
-      }
-      console.log(recordTypes[i]);
-      numRecords += records.length;
+  const syncBatch = async (records, recordType) => {
+    const batchSize = 50;
+    const batches = [];
+    
+    for (let i = 0; i < records.length; i += batchSize) {
+      batches.push(records.slice(i, i + batchSize));
+    }
 
-      if (['SleepSession', 'Speed', 'HeartRate'].includes(recordTypes[i])) {
-        console.log("INSIDE IF - ", recordTypes[i])
-        for (let j=0; j<records.length; j++) {
-          console.log("INSIDE FOR", j, recordTypes[i])
-          setTimeout(async () => {
+    for (const batch of batches) {
+      try {
+        if (['SleepSession', 'Speed', 'HeartRate'].includes(recordType)) {
+          await Promise.all(batch.map(async (record) => {
             try {
-              let record = await readRecord(recordTypes[i], records[j].metadata.id);
-              await axios.post(`${apiBase}/api/v2/sync/${recordTypes[i]}`, {
-                data: record
+              const detailedRecord = await readRecord(recordType, record.metadata.id);
+              await axios.post(`${apiBase}/api/v2/sync/${recordType}`, {
+                data: detailedRecord
               }, {
                 headers: {
                   "Authorization": `Bearer ${login}`
                 }
-              })
+              });
+              numRecordsSynced++;
+              updateProgress();
+            } catch (err) {
+              console.error(`Error syncing ${recordType}:`, err);
+              failedRecords.push({ type: recordType, id: record.metadata.id, error: err.message });
             }
-            catch (err) {
-              console.log(err)
+          }));
+        } else {
+          await axios.post(`${apiBase}/api/v2/sync/${recordType}`, {
+            data: batch
+          }, {
+            headers: {
+              "Authorization": `Bearer ${login}`
             }
-
-            numRecordsSynced += 1;
-            try {
-            ReactNativeForegroundService.update({
-              id: 1244,
-              title: 'HCGateway Sync Progress',
-              message: `HCGateway is currently syncing... [${numRecordsSynced}/${numRecords}]`,
-              icon: 'ic_launcher',
-              setOnlyAlertOnce: true,
-              color: '#000000',
-              progress: {
-                max: numRecords,
-                curr: numRecordsSynced,
-              }
-            })
-
-            if (numRecordsSynced == numRecords) {
-              ReactNativeForegroundService.update({
-                id: 1244,
-                title: 'HCGateway Sync Progress',
-                message: `HCGateway is working in the background to sync your data.`,
-                icon: 'ic_launcher',
-                setOnlyAlertOnce: true,
-                color: '#000000',
-              })
-            }
-            }
-            catch {}
-          }, j*3000)
+          });
+          numRecordsSynced += batch.length;
+          updateProgress();
         }
+      } catch (err) {
+        console.error(`Error syncing batch of ${recordType}:`, err);
+        failedRecords.push(...batch.map(record => ({
+          type: recordType,
+          id: record.metadata.id,
+          error: err.message
+        })));
       }
-
-      else {
-        await axios.post(`${apiBase}/api/v2/sync/${recordTypes[i]}`, {
-          data: records
-        }, {
-          headers: {
-            "Authorization": `Bearer ${login}`
-          }
-        });
-        numRecordsSynced += records.length;
-        try {
-        ReactNativeForegroundService.update({
-          id: 1244,
-          title: 'HCGateway Sync Progress',
-          message: `HCGateway is currently syncing... [${numRecordsSynced}/${numRecords}]`,
-          icon: 'ic_launcher',
-          setOnlyAlertOnce: true,
-          color: '#000000',
-          progress: {
-            max: numRecords,
-            curr: numRecordsSynced,
-          }
-        })
-
-        if (numRecordsSynced == numRecords) {
-          ReactNativeForegroundService.update({
-            id: 1244,
-            title: 'HCGateway Sync Progress',
-            message: `HCGateway is working in the background to sync your data.`,
-            icon: 'ic_launcher',
-            setOnlyAlertOnce: true,
-            color: '#000000',
-          })
-        }
-        }
-        catch {}
-      }
-  }
-}
-
-const handlePush = async (message) => {
-  const isInitialized = await initialize();
-  
-  let data = JSON.parse(message.data);
-  console.log(data);
-
-  insertRecords(data)
-  .then((ids) => {
-    console.log("Records inserted successfully: ", { ids });
-  })
-  .catch((error) => {
-    Notifications.postLocalNotification({
-      body: "Error: " + error.message,
-      title: `Push failed for ${data[0].recordType}`,
-      silent: false,
-      category: "Push Errors",
-      fireDate: new Date(),
-      android_channel_id: 'push-errors',
-    });
-  })
-}
-
-const handleDel = async (message) => {
-  const isInitialized = await initialize();
-  
-  let data = JSON.parse(message.data);
-  console.log(data);
-
-  deleteRecordsByUuids(data.recordType, data.uuids, data.uuids)
-  axios.delete(`${apiBase}/api/v2/sync/${data.recordType}`, {
-    data: {
-      uuid: data.uuids,
-    },
-    headers: {
-      "Authorization": `Bearer ${login}`
     }
-  })
+  };
+
+  for (const recordType of recordTypes) {
+    try {
+      const response = await readRecords(recordType, {
+        timeRangeFilter: {
+          operator: "between",
+          startTime: String(new Date(new Date().setDate(new Date().getDate() - 29)).toISOString()),
+          endTime: String(new Date().toISOString())
+        }
+      });
+
+      const records = response.records;
+      numRecords += records.length;
+      await syncBatch(records, recordType);
+    } catch (err) {
+      console.error(`Error reading ${recordType}:`, err);
+      continue;
+    }
+  }
+
+  if (failedRecords.length > 0) {
+    console.log('Failed records:', failedRecords);
+    Toast.show({
+      type: 'warning',
+      text1: "Sync completed with errors",
+      text2: `${failedRecords.length} records failed to sync`
+    });
+  } else {
+    Toast.show({
+      type: 'success',
+      text1: "Sync completed successfully",
+      text2: `${numRecordsSynced} records synced`
+    });
+  }
+
+  ReactNativeForegroundService.update({
+    id: 1244,
+    title: 'HCGateway Sync Progress',
+    message: `HCGateway is working in the background to sync your data.`,
+    icon: 'ic_launcher',
+    setOnlyAlertOnce: true,
+    color: '#000000',
+  });
 }
-  
+}
 
 export default function App() {
   const [, forceUpdate] = React.useReducer(x => x + 1, 0);
@@ -432,8 +305,6 @@ export default function App() {
     })
 
     try {
-    let fcmToken = await requestUserPermission();
-    form.fcmToken = fcmToken;
     let response = await axios.post(`${apiBase}/api/v2/login`, form);
     if ('token' in response.data) {
       console.log(response.data);
@@ -489,13 +360,6 @@ export default function App() {
           onError: e => console.log(`Error logging:`, e),
         });
 
-        ReactNativeForegroundService.add_task(() => refreshTokenFunc(), {
-          delay: 10800 * 1000,
-          onLoop: true,
-          taskId: 'refresh_token',
-          onError: e => console.log(`Error logging:`, e),
-        });
-
         ReactNativeForegroundService.start({
           id: 1244,
           title: 'HCGateway Sync Service',
@@ -546,36 +410,6 @@ export default function App() {
               })
             }}
           />
-
-            <View style={{ flexDirection: 'row', alignItems: 'center', marginVertical: 10 }}>
-            <Text style={{ fontSize: 15 }}>Enable Sentry:</Text>
-            <Switch
-              value={isSentryEnabled}
-              onValueChange={async (value) => {
-              if (value) {
-                Sentry.init({
-                dsn: 'https://e4a201b96ea602d28e90b5e4bbe67aa6@sentry.shuchir.dev/6',
-                });
-                Toast.show({
-                type: 'success',
-                text1: "Sentry enabled",
-                });
-                isSentryEnabled = true;
-                forceUpdate();
-              } else {
-                Sentry.close();
-                Toast.show({
-                type: 'success',
-                text1: "Sentry disabled",
-                });
-                isSentryEnabled = false;
-                forceUpdate();
-              }
-              await setPlain('sentryEnabled', value.toString());
-              }}
-            />
-            </View>
-
           <View style={{ marginTop: 20 }}>
             <Button
               title="Sync Now"
@@ -633,36 +467,6 @@ export default function App() {
               setPlain('apiBase', text);
             }}
           />
-
-          <View style={{ flexDirection: 'row', alignItems: 'center', marginVertical: 10 }}>
-            <Text style={{ fontSize: 15 }}>Enable Sentry:</Text>
-            <Switch
-              value={isSentryEnabled}
-              defaultValue={isSentryEnabled}
-              onValueChange={async (value) => {
-                if (value) {
-                  Sentry.init({
-                    dsn: 'https://e4a201b96ea602d28e90b5e4bbe67aa6@sentry.shuchir.dev/6',
-                  });
-                  Toast.show({
-                    type: 'success',
-                    text1: "Sentry enabled",
-                  });
-                  isSentryEnabled = true;
-                  forceUpdate();
-                } else {
-                  Sentry.close();
-                  Toast.show({
-                    type: 'success',
-                    text1: "Sentry disabled",
-                  });
-                  isSentryEnabled = false;
-                  forceUpdate();
-                }
-                await setPlain('sentryEnabled', value.toString());
-              }} 
-            />
-          </View>
 
           <Button
             title="Login"

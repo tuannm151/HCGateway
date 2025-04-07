@@ -15,14 +15,6 @@
           }
         }
       ],
-      [
-        "@sentry/react-native/expo",
-        {
-          "url": "https://sentry.shuchir.dev/",
-          "project": "hcgateway-app",
-          "organization": "sentry"
-        }
-      ],
       "@react-native-firebase/app",
       "@react-native-firebase/messaging"
     ],
